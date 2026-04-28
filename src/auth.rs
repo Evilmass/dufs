@@ -12,13 +12,15 @@ use sha2::{Digest, Sha256};
 use sha_crypt::PasswordVerifier;
 use std::{
     collections::HashMap,
+    env,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
 const REALM: &str = "DUFS";
 const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60 * 24 * 7; // 7 days
-const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
+const TOKEN_EXPIRATION: u64 = 60 * 60 * 24 * 3; // 3 days
+const MAX_TOKEN_EXPIRATION: u64 = 60 * 60 * 24 * 365; // 1 year
 
 lazy_static! {
     static ref NONCESTARTHASH: Context = {
@@ -159,12 +161,12 @@ impl AccessControl {
         (None, None)
     }
 
-    pub fn generate_token(&self, path: &str, user: &str) -> Result<String> {
+    pub fn generate_token(&self, path: &str, user: &str, duration: Option<u64>) -> Result<String> {
         let (pass, _) = self
             .users
             .get(user)
             .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
-        let exp = unix_now().as_millis() as u64 + TOKEN_EXPIRATION;
+        let exp = unix_now().as_millis() as u64 + token_expiration_millis(duration)?;
         let message = format!("{path}:{exp}");
         let mut signing_key = derive_secret_key(user, pass);
         let sig = signing_key.sign(message.as_bytes()).to_bytes();
@@ -205,6 +207,25 @@ impl AccessControl {
         derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
         Ok((user.to_string(), ap))
     }
+}
+
+fn token_expiration_millis(duration: Option<u64>) -> Result<u64> {
+    let seconds = match duration {
+        Some(duration) => duration,
+        None => match env::var("TOKEN_EXPIRATION") {
+            Ok(value) => value
+                .parse::<u64>()
+                .map_err(|_| anyhow!("Invalid TOKEN_EXPIRATION `{value}`"))?,
+            Err(env::VarError::NotPresent) => TOKEN_EXPIRATION,
+            Err(err) => return Err(anyhow!("Invalid TOKEN_EXPIRATION: {err}")),
+        },
+    };
+
+    if seconds > MAX_TOKEN_EXPIRATION {
+        bail!("Token expiration exceeds maximum of {MAX_TOKEN_EXPIRATION} seconds");
+    }
+
+    Ok(seconds * 1000)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

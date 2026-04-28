@@ -403,5 +403,26 @@ fn token_auth(#[with(&["-a", "user:pass@/"])] server: TestServer) -> Result<(), 
     let url = format!("{}index.html?token={token}", server.url());
     let resp = fetch!(b"GET", &url).send()?;
     assert_eq!(resp.status(), 200);
+
+    let url = format!("{}index.html?tokengen&duration=60", server.url());
+    let resp = fetch!(b"GET", &url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    let token = resp.text()?;
+    let url = format!("{}index.html?token={token}", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+
+    let url = format!("{}index.html?tokengen&duration=abc", server.url());
+    let resp = fetch!(b"GET", &url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 500);
+
+    let url = format!("{}index.html?tokengen&duration=31536001", server.url());
+    let resp = fetch!(b"GET", &url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 500);
     Ok(())
 }

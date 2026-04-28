@@ -230,7 +230,8 @@ impl Server {
         }
 
         if has_query_flag(&query_params, "tokengen") {
-            self.handle_tokengen(&relative_path, user, &mut res).await?;
+            self.handle_tokengen(&relative_path, user, query_params.get("duration"), &mut res)
+                .await?;
             return Ok(res);
         }
 
@@ -1077,12 +1078,14 @@ impl Server {
         &self,
         relative_path: &str,
         user: Option<String>,
+        duration: Option<&String>,
         res: &mut Response,
     ) -> Result<()> {
+        let duration = duration.map(|v| v.parse::<u64>()).transpose()?;
         let output = self
             .args
             .auth
-            .generate_token(relative_path, &user.unwrap_or_default())?;
+            .generate_token(relative_path, &user.unwrap_or_default(), duration)?;
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_PLAIN_UTF_8));
         res.headers_mut()
