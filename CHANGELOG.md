@@ -2,6 +2,68 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.47.0] - 2026-10-17
+
+### Features
+
+- Conditionally include default IPv6 addr ([#721](https://github.com/sigoden/dufs/issues/721))
+- Webui better uploaders ([#749](https://github.com/sigoden/dufs/issues/749))
+- Support HEAD requests for embedded assets and health check ([#750](https://github.com/sigoden/dufs/issues/750))
+- Render placeholders in custom 404 page ([#752](https://github.com/sigoden/dufs/issues/752))
+- Preserve directory entries and metadata when zipping a directory ([#760](https://github.com/sigoden/dufs/issues/760))
+
+### Bug Fixes
+
+- Liblzma dynamic linking issues on MacOS ([#712](https://github.com/sigoden/dufs/issues/712))
+- Guard_root_contained walks up to existing ancestor for non-existent paths ([#716](https://github.com/sigoden/dufs/issues/716))
+- Return response after forbid status ([#722](https://github.com/sigoden/dufs/issues/722))
+- Require path separator boundary when stripping --path-prefix ([#725](https://github.com/sigoden/dufs/issues/725))
+- Clamp range last-pos to EOF per RFC 9110 ([#738](https://github.com/sigoden/dufs/issues/738))
+- Keep directories grouped on top when sorting in descending order ([#732](https://github.com/sigoden/dufs/issues/732))
+- Enhance security ([#753](https://github.com/sigoden/dufs/issues/753))
+- Close path ACL bypass via filesystem name aliases ([#754](https://github.com/sigoden/dufs/issues/754))
+- Serve HTML/SVG/XML files inline again ([#759](https://github.com/sigoden/dufs/issues/759))
+- Bind unix socket address only once ([#761](https://github.com/sigoden/dufs/issues/761))
+- Don't set SO_REUSEADDR on Windows ([#762](https://github.com/sigoden/dufs/issues/762))
+- Eliminate panics that could abort the server ([#764](https://github.com/sigoden/dufs/issues/764))
+
+### Refactor
+
+- Handle unspecified ip addrs in check_addrs ([#708](https://github.com/sigoden/dufs/issues/708))
+- Webui add css color variables ([#710](https://github.com/sigoden/dufs/issues/710))
+- Replace async-zip with async-deflate-zip ([#720](https://github.com/sigoden/dufs/issues/720))
+- Upgrade async-deflate-zip to v0.2.0 ([#723](https://github.com/sigoden/dufs/issues/723))
+- Improve server port selection ([#748](https://github.com/sigoden/dufs/issues/748))
+- Send title-case HTTP/1 response header names ([#751](https://github.com/sigoden/dufs/issues/751))
+- Reduce release binary size ([#763](https://github.com/sigoden/dufs/issues/763))
+
+## [0.46.0] - 2026-05-07
+
+### Features
+
+- Add option --allow-hash to allow/disallow file hashing ([#657](https://github.com/sigoden/dufs/issues/657))
+- Support `?json` on file path ([#686](https://github.com/sigoden/dufs/issues/686))
+- Support customizable 404 page ([#688](https://github.com/sigoden/dufs/issues/688))
+- Enhance log format ([#692](https://github.com/sigoden/dufs/issues/692))
+- Webui confirm on exit while uploading ([#693](https://github.com/sigoden/dufs/issues/693))
+- Skip directory walking in HEAD requests ([#701](https://github.com/sigoden/dufs/issues/701))
+
+### Bug Fixes
+
+- Some search results missing due to broken symlinks ([#665](https://github.com/sigoden/dufs/issues/665))
+- Escape filename in ?simple output ([#669](https://github.com/sigoden/dufs/issues/669))
+- Ensure symlink inside serve root ([#670](https://github.com/sigoden/dufs/issues/670))
+- Tweak auth logic ([#689](https://github.com/sigoden/dufs/issues/689))
+- Http range underflow ([#690](https://github.com/sigoden/dufs/issues/690))
+- Escape control chars in logged URI and headers ([#691](https://github.com/sigoden/dufs/issues/691))
+- Webui safari bug uploadspeed ([#695](https://github.com/sigoden/dufs/issues/695))
+
+### Refactor
+
+- Update deps ([#655](https://github.com/sigoden/dufs/issues/655))
+- Improve UI button titles ([#656](https://github.com/sigoden/dufs/issues/656))
+- Webui file size format ([#698](https://github.com/sigoden/dufs/issues/698))
+
 ## [0.45.0] - 2025-09-03
 
 ### Bug Fixes

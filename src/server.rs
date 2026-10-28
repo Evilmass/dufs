@@ -1,16 +1,16 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
+use crate::auth::{www_authenticate, AccessPaths, AccessPerm, EntryAccess};
+use crate::error::DufsErrorCode;
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
-    decode_uri, encode_uri, get_file_mtime_and_mode, get_file_name, glob, parse_range,
-    try_get_file_name,
+    decode_uri, encode_uri, get_file_name, glob, join_within, parse_range, try_get_file_name,
 };
 use crate::Args;
 
 use anyhow::{anyhow, Result};
-use async_zip::{tokio::write::ZipFileWriter, Compression, ZipDateTime, ZipEntryBuilder};
+use async_deflate_zip::{CompressionLevel, EntryOptions, ZipWriter};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
@@ -42,11 +42,9 @@ use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
 
-use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
@@ -80,10 +78,13 @@ impl Server {
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
-                args.uri_prefix[0..args.uri_prefix.len() - 1].to_string(),
+                args.uri_prefix
+                    .strip_suffix('/')
+                    .unwrap_or(&args.uri_prefix)
+                    .to_string(),
                 encode_uri(&format!(
                     "{}{}",
-                    &args.uri_prefix,
+                    args.uri_prefix,
                     get_file_name(&args.serve_path)
                 )),
             ]
@@ -152,14 +153,14 @@ impl Server {
         let relative_path = match self.resolve_path(req_path) {
             Some(v) => v,
             None => {
-                status_bad_request(&mut res, "Invalid Path");
+                DufsErrorCode::InvalidPath.respond(&mut res);
                 return Ok(res);
             }
         };
 
-        if method == Method::GET
+        if (method == Method::GET || method == Method::HEAD)
             && self
-                .handle_internal(&relative_path, headers, &mut res)
+                .handle_internal(&relative_path, method == Method::HEAD, headers, &mut res)
                 .await?
         {
             return Ok(res);
@@ -180,27 +181,34 @@ impl Server {
         }
 
         let authorization = headers.get(AUTHORIZATION);
+        let request_target = req.uri().to_string();
 
         let query = req.uri().query().unwrap_or_default();
         let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        let guard = self.args.auth.guard(
-            &relative_path,
-            &method,
-            authorization,
-            query_params.get("token"),
-            is_microsoft_webdav,
-        );
+        let (user, access_paths, via_token, stale) = self
+            .args
+            .auth
+            .guard(
+                &relative_path,
+                &method,
+                &request_target,
+                authorization,
+                query_params.get("token"),
+                is_microsoft_webdav,
+                &self.args.serve_path,
+            )
+            .await;
 
-        let (user, access_paths) = match guard {
+        let (user, access_paths) = match (user, access_paths) {
             (None, None) => {
-                self.auth_reject(&mut res)?;
+                self.auth_reject(&mut res, stale)?;
                 return Ok(res);
             }
             (Some(_), None) => {
-                status_forbid(&mut res);
+                DufsErrorCode::Forbidden.respond(&mut res);
                 return Ok(res);
             }
             (x, Some(y)) => (x, y),
@@ -217,7 +225,7 @@ impl Server {
                 }
                 None => {
                     if has_query_flag(&query_params, "login") || !access_paths.perm().readwrite() {
-                        self.auth_reject(&mut res)?
+                        self.auth_reject(&mut res, false)?
                     } else {
                         *res.body_mut() = body_full("");
                     }
@@ -225,17 +233,29 @@ impl Server {
             }
             return Ok(res);
         } else if method.as_str() == "LOGOUT" {
-            self.auth_reject(&mut res)?;
+            self.auth_reject(&mut res, false)?;
             return Ok(res);
         }
+
+        let head_only = method == Method::HEAD || method == Method::OPTIONS;
 
         if has_query_flag(&query_params, "tokengen") {
-            self.handle_tokengen(&relative_path, user, query_params.get("duration"), &mut res)
-                .await?;
+            // A share token must not be able to mint another token, otherwise a
+            // short-lived link could be renewed forever regardless of expiry.
+            if via_token {
+                self.auth_reject(&mut res, false)?;
+                return Ok(res);
+            }
+            self.handle_tokengen(
+                &relative_path,
+                user,
+                query_params.get("duration"),
+                head_only,
+                &mut res,
+            )
+            .await?;
             return Ok(res);
         }
-
-        let head_only = method == Method::HEAD;
 
         if self.args.path_is_file {
             if self
@@ -246,7 +266,7 @@ impl Server {
                 self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
                     .await?;
             } else {
-                self.handle_not_found(&query_params, headers, head_only, &mut res)
+                self.handle_not_found(&query_params, head_only, &mut res)
                     .await?;
             }
             return Ok(res);
@@ -254,7 +274,7 @@ impl Server {
         let path = match self.join_path(&relative_path) {
             Some(v) => v,
             None => {
-                status_forbid(&mut res);
+                DufsErrorCode::Forbidden.respond(&mut res);
                 return Ok(res);
             }
         };
@@ -275,7 +295,7 @@ impl Server {
         let render_try_index = self.args.render_try_index;
 
         if self.guard_root_contained(path).await {
-            self.handle_not_found(&query_params, headers, head_only, &mut res)
+            self.handle_not_found(&query_params, head_only, &mut res)
                 .await?;
             return Ok(res);
         }
@@ -286,7 +306,7 @@ impl Server {
                     if render_try_index {
                         if allow_archive && has_query_flag(&query_params, "zip") {
                             if !allow_archive {
-                                self.handle_not_found(&query_params, headers, head_only, &mut res)
+                                self.handle_not_found(&query_params, head_only, &mut res)
                                     .await?;
                                 return Ok(res);
                             }
@@ -327,7 +347,7 @@ impl Server {
                         .await?;
                     } else if has_query_flag(&query_params, "zip") {
                         if !allow_archive {
-                            status_not_found(&mut res);
+                            DufsErrorCode::ArchiveDisabled.respond(&mut res);
                             return Ok(res);
                         }
                         self.handle_zip_dir(path, head_only, access_paths, &mut res)
@@ -356,18 +376,33 @@ impl Server {
                     }
                 } else if is_file {
                     if has_query_flag(&query_params, "json") {
-                        self.handle_file_json(path, head_only, &mut res).await?;
+                        self.handle_file_json(path, head_only, &access_paths, &mut res)
+                            .await?;
                     } else if has_query_flag(&query_params, "edit") {
-                        self.handle_edit_file(path, DataKind::Edit, head_only, user, &mut res)
-                            .await?;
+                        self.handle_edit_file(
+                            path,
+                            DataKind::Edit,
+                            head_only,
+                            user,
+                            &access_paths,
+                            &mut res,
+                        )
+                        .await?;
                     } else if has_query_flag(&query_params, "view") {
-                        self.handle_edit_file(path, DataKind::View, head_only, user, &mut res)
-                            .await?;
+                        self.handle_edit_file(
+                            path,
+                            DataKind::View,
+                            head_only,
+                            user,
+                            &access_paths,
+                            &mut res,
+                        )
+                        .await?;
                     } else if has_query_flag(&query_params, "hash") {
                         if self.args.allow_hash {
                             self.handle_hash_file(path, head_only, &mut res).await?;
                         } else {
-                            status_forbid(&mut res);
+                            DufsErrorCode::HashDisabled.respond(&mut res);
                         }
                     } else {
                         self.handle_send_file(path, headers, head_only, &mut res)
@@ -388,7 +423,7 @@ impl Server {
                     )
                     .await?;
                 } else {
-                    self.handle_not_found(&query_params, headers, head_only, &mut res)
+                    self.handle_not_found(&query_params, head_only, &mut res)
                         .await?;
                 }
             }
@@ -396,8 +431,12 @@ impl Server {
                 set_webdav_headers(&mut res);
             }
             Method::PUT => {
-                if is_dir || !allow_upload || (!allow_delete && size > 0) {
-                    status_forbid(&mut res);
+                if is_dir {
+                    DufsErrorCode::IsADirectory.respond(&mut res);
+                } else if !allow_upload {
+                    DufsErrorCode::UploadDisabled.respond(&mut res);
+                } else if !allow_delete && size > 0 {
+                    DufsErrorCode::DeleteDisabled.respond(&mut res);
                 } else {
                     self.handle_upload(path, None, size, req, &mut res).await?;
                 }
@@ -406,34 +445,40 @@ impl Server {
                 if is_miss {
                     status_not_found(&mut res);
                 } else if !allow_upload {
-                    status_forbid(&mut res);
+                    DufsErrorCode::UploadDisabled.respond(&mut res);
                 } else {
                     let offset = match parse_upload_offset(headers, size) {
                         Ok(v) => v,
                         Err(err) => {
-                            status_bad_request(&mut res, &err.to_string());
+                            DufsErrorCode::InvalidUploadOffset
+                                .respond_with(&mut res, &err.to_string());
                             return Ok(res);
                         }
                     };
                     match offset {
                         Some(offset) => {
                             if offset < size && !allow_delete {
-                                status_forbid(&mut res);
+                                DufsErrorCode::DeleteDisabled.respond(&mut res);
+                                return Ok(res);
                             }
                             self.handle_upload(path, Some(offset), size, req, &mut res)
                                 .await?;
                         }
                         None => {
-                            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                            DufsErrorCode::MissingUploadOffset.respond(&mut res);
                         }
                     }
                 }
             }
             Method::DELETE => {
                 if !allow_delete {
-                    status_forbid(&mut res);
+                    DufsErrorCode::DeleteDisabled.respond(&mut res);
                 } else if !is_miss {
-                    self.handle_delete(path, is_dir, &mut res).await?
+                    if is_dir && Self::has_restricted_descendant(&access_paths) {
+                        DufsErrorCode::ReadonlyDescendant.respond(&mut res);
+                    } else {
+                        self.handle_delete(path, is_dir, &mut res).await?
+                    }
                 } else {
                     status_not_found(&mut res);
                 }
@@ -465,17 +510,16 @@ impl Server {
                 }
                 "MKCOL" => {
                     if !allow_upload {
-                        status_forbid(&mut res);
+                        DufsErrorCode::UploadDisabled.respond(&mut res);
                     } else if !is_miss {
-                        *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                        *res.body_mut() = body_full("Already exists");
+                        DufsErrorCode::AlreadyExists.respond(&mut res);
                     } else {
                         self.handle_mkcol(path, &mut res).await?;
                     }
                 }
                 "COPY" => {
                     if !allow_upload {
-                        status_forbid(&mut res);
+                        DufsErrorCode::UploadDisabled.respond(&mut res);
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
@@ -483,10 +527,14 @@ impl Server {
                     }
                 }
                 "MOVE" => {
-                    if !allow_upload || !allow_delete {
-                        status_forbid(&mut res);
+                    if !allow_upload {
+                        DufsErrorCode::UploadDisabled.respond(&mut res);
+                    } else if !allow_delete {
+                        DufsErrorCode::DeleteDisabled.respond(&mut res);
                     } else if is_miss {
                         status_not_found(&mut res);
+                    } else if is_dir && Self::has_restricted_descendant(&access_paths) {
+                        DufsErrorCode::ReadonlyDescendant.respond(&mut res);
                     } else {
                         self.handle_move(path, &req, &mut res).await?
                     }
@@ -507,7 +555,7 @@ impl Server {
                     }
                 }
                 _ => {
-                    *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                    DufsErrorCode::MethodNotAllowed.respond(&mut res);
                 }
             },
         }
@@ -559,6 +607,16 @@ impl Server {
         Ok(())
     }
 
+    /// Whether a recursive write on the guarded path would also affect a path
+    /// with a stricter rule.
+    ///
+    /// Recursive operations must be rejected then: `remove_dir_all` and
+    /// `rename` act on the whole subtree, so they would remove or relocate a
+    /// child that a direct request to that child is not allowed to touch.
+    fn has_restricted_descendant(access_paths: &AccessPaths) -> bool {
+        access_paths.has_stricter_descendant(AccessPerm::ReadWrite)
+    }
+
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
         match is_dir {
             true => fs::remove_dir_all(path).await?,
@@ -580,11 +638,11 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         let mut paths = vec![];
-        if exist {
-            paths = match self.list_dir(path, path, access_paths.clone()).await {
+        if !head_only && exist {
+            paths = match self.list_dir(path, path, &access_paths).await {
                 Ok(paths) => paths,
                 Err(_) => {
-                    status_forbid(res);
+                    DufsErrorCode::InternalError.respond(res);
                     return Ok(());
                 }
             }
@@ -619,14 +677,16 @@ impl Server {
             return self
                 .handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
                 .await;
-        } else {
+        }
+
+        if !head_only {
             let path_buf = path.to_path_buf();
             let hidden = Arc::new(self.args.hidden.to_vec());
             let search = search.clone();
+            let prefix = self.relative_parts(path);
 
-            let access_paths = access_paths.clone();
             let search_paths = tokio::spawn(collect_dir_entries(
-                access_paths,
+                access_paths.clone(),
                 self.running.clone(),
                 path_buf,
                 hidden,
@@ -637,7 +697,12 @@ impl Server {
             .await?;
 
             for search_path in search_paths.into_iter() {
-                if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await {
+                if let Ok(Some(mut item)) = self.to_pathitem(search_path, path.to_path_buf()).await
+                {
+                    let access = access_paths
+                        .entry_access(&item.name, &prefix, Some(&self.args.serve_path))
+                        .await;
+                    self.set_item_access(&mut item, access);
                     paths.push(item);
                 }
             }
@@ -725,8 +790,7 @@ impl Server {
             self.handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
                 .await?;
         } else {
-            self.handle_not_found(query_params, headers, head_only, res)
-                .await?;
+            self.handle_not_found(query_params, head_only, res).await?;
         }
         Ok(())
     }
@@ -735,15 +799,23 @@ impl Server {
         &self,
         path: &Path,
         head_only: bool,
+        access_paths: &AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
-        let pathitem = match self.to_pathitem(path, &self.args.serve_path).await? {
+        let mut pathitem = match self.to_pathitem(path, &self.args.serve_path).await? {
             Some(v) => v,
             None => {
                 status_not_found(res);
                 return Ok(());
             }
         };
+        self.set_item_access(
+            &mut pathitem,
+            EntryAccess {
+                perm: access_paths.perm(),
+                restricted: false,
+            },
+        );
         let output = serde_json::to_string_pretty(&pathitem)?;
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
@@ -769,8 +841,7 @@ impl Server {
             self.handle_send_file(&path, headers, head_only, res)
                 .await?;
         } else {
-            self.handle_not_found(query_params, headers, head_only, res)
-                .await?;
+            self.handle_not_found(query_params, head_only, res).await?;
         }
         Ok(())
     }
@@ -778,13 +849,12 @@ impl Server {
     async fn handle_not_found(
         &self,
         query_params: &HashMap<String, String>,
-        headers: &HeaderMap<HeaderValue>,
         head_only: bool,
         res: &mut Response,
     ) -> Result<()> {
         if let Some(error_page) = &self.args.error_page {
             if !has_query_flag(query_params, "noscript") {
-                self.handle_send_file(error_page, headers, head_only, res)
+                self.handle_send_error_page(error_page, head_only, res)
                     .await?;
                 *res.status_mut() = StatusCode::NOT_FOUND;
                 return Ok(());
@@ -794,18 +864,59 @@ impl Server {
         Ok(())
     }
 
+    async fn handle_send_error_page(
+        &self,
+        path: &Path,
+        head_only: bool,
+        res: &mut Response,
+    ) -> Result<()> {
+        let html = fs::read_to_string(path).await?;
+        let output = self.render_html(&html);
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        res.headers_mut()
+            .typed_insert(CacheControl::new().with_no_cache());
+        res.headers_mut().insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
+        if head_only {
+            return Ok(());
+        }
+        *res.body_mut() = body_full(output);
+        Ok(())
+    }
+
+    fn render_html(&self, html: &str) -> String {
+        html.replace(
+            "__ASSETS_PREFIX__",
+            &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
+        )
+        .replace("__PATH_PREFIX__", &self.args.uri_prefix)
+    }
+
     async fn handle_internal(
         &self,
         req_path: &str,
+        head_only: bool,
         headers: &HeaderMap<HeaderValue>,
         res: &mut Response,
     ) -> Result<bool> {
         if let Some(name) = req_path.strip_prefix(&self.assets_prefix) {
             match self.args.assets.as_ref() {
                 Some(assets_path) => {
-                    let path = assets_path.join(name);
+                    let path = match join_within(assets_path, name) {
+                        Some(path) => path,
+                        None => {
+                            status_not_found(res);
+                            return Ok(true);
+                        }
+                    };
                     if path.exists() {
-                        self.handle_send_file(&path, headers, false, res).await?;
+                        self.handle_send_file(&path, headers, head_only, res)
+                            .await?;
                     } else {
                         status_not_found(res);
                         return Ok(true);
@@ -813,23 +924,35 @@ impl Server {
                 }
                 None => match name {
                     "index.js" => {
-                        *res.body_mut() = body_full(INDEX_JS);
                         res.headers_mut().insert(
                             "content-type",
                             HeaderValue::from_static("application/javascript; charset=UTF-8"),
                         );
+                        res.headers_mut()
+                            .typed_insert(ContentLength(INDEX_JS.len() as u64));
+                        if !head_only {
+                            *res.body_mut() = body_full(INDEX_JS);
+                        }
                     }
                     "index.css" => {
-                        *res.body_mut() = body_full(INDEX_CSS);
                         res.headers_mut().insert(
                             "content-type",
                             HeaderValue::from_static("text/css; charset=UTF-8"),
                         );
+                        res.headers_mut()
+                            .typed_insert(ContentLength(INDEX_CSS.len() as u64));
+                        if !head_only {
+                            *res.body_mut() = body_full(INDEX_CSS);
+                        }
                     }
                     "favicon.ico" => {
-                        *res.body_mut() = body_full(FAVICON_ICO);
                         res.headers_mut()
                             .insert("content-type", HeaderValue::from_static("image/x-icon"));
+                        res.headers_mut()
+                            .typed_insert(ContentLength(FAVICON_ICO.len() as u64));
+                        if !head_only {
+                            *res.body_mut() = body_full(FAVICON_ICO);
+                        }
                     }
                     _ => {
                         status_not_found(res);
@@ -848,8 +971,12 @@ impl Server {
         } else if req_path == HEALTH_CHECK_PATH {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
-
-            *res.body_mut() = body_full(r#"{"status":"OK"}"#);
+            let body = r#"{"status":"OK"}"#;
+            res.headers_mut()
+                .typed_insert(ContentLength(body.len() as u64));
+            if !head_only {
+                *res.body_mut() = body_full(body);
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -870,13 +997,13 @@ impl Server {
         if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
             if let Some(if_unmodified_since) = headers.typed_get::<IfUnmodifiedSince>() {
                 if !if_unmodified_since.precondition_passes(last_modified.into()) {
-                    *res.status_mut() = StatusCode::PRECONDITION_FAILED;
+                    DufsErrorCode::PreconditionFailed.respond(res);
                     return Ok(());
                 }
             }
             if let Some(if_match) = headers.typed_get::<IfMatch>() {
                 if !if_match.precondition_passes(&etag) {
-                    *res.status_mut() = StatusCode::PRECONDITION_FAILED;
+                    DufsErrorCode::PreconditionFailed.respond(res);
                     return Ok(());
                 }
             }
@@ -956,32 +1083,60 @@ impl Server {
                 } else {
                     *res.status_mut() = StatusCode::PARTIAL_CONTENT;
                     let boundary = Uuid::new_v4();
-                    let mut body = Vec::new();
                     let content_type = get_content_type(path).await?;
-                    for (start, end) in ranges {
-                        file.seek(SeekFrom::Start(start)).await?;
+                    let footer = format!("--{boundary}--\r\n");
+
+                    // Compute the exact length up front, so a HEAD request (and
+                    // the Content-Length header) never has to read the file.
+                    let mut content_length = footer.len();
+                    for (start, end) in &ranges {
                         let range_size = end - start + 1;
-                        let content_range = format!("bytes {start}-{end}/{size}");
                         let part_header = format!(
-                            "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: {content_range}\r\n\r\n",
+                            "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{size}\r\n\r\n",
                         );
-                        body.extend_from_slice(part_header.as_bytes());
-                        let mut buffer = vec![0; range_size as usize];
-                        file.read_exact(&mut buffer).await?;
-                        body.extend_from_slice(&buffer);
-                        body.extend_from_slice(b"\r\n");
+                        content_length = content_length
+                            .saturating_add(part_header.len())
+                            .saturating_add(usize::try_from(range_size).unwrap_or(usize::MAX))
+                            .saturating_add(2);
                     }
-                    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
                     res.headers_mut().insert(
                         CONTENT_TYPE,
                         format!("multipart/byteranges; boundary={boundary}").parse()?,
                     );
                     res.headers_mut()
-                        .insert(CONTENT_LENGTH, format!("{}", body.len()).parse()?);
+                        .insert(CONTENT_LENGTH, format!("{content_length}").parse()?);
                     if head_only {
                         return Ok(());
                     }
-                    *res.body_mut() = body_full(body);
+
+                    // Stream the parts instead of materializing the whole body
+                    // in memory.
+                    let stream = async_stream::try_stream! {
+                        let mut buffer = vec![0; BUF_SIZE];
+                        for (start, end) in ranges {
+                            file.seek(SeekFrom::Start(start)).await?;
+                            let part_header = format!(
+                                "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{size}\r\n\r\n",
+                            );
+                            yield Bytes::from(part_header);
+                            let mut remaining = end - start + 1;
+                            while remaining > 0 {
+                                let want = remaining.min(BUF_SIZE as u64) as usize;
+                                file.read_exact(&mut buffer[..want]).await?;
+                                yield Bytes::copy_from_slice(&buffer[..want]);
+                                remaining -= want as u64;
+                            }
+                            yield Bytes::from_static(b"\r\n");
+                        }
+                        yield Bytes::from(footer);
+                    };
+                    let stream_body = StreamBody::new(
+                        stream
+                            .map_ok(Frame::data)
+                            .map_err(|err: io::Error| anyhow::Error::new(err)),
+                    );
+                    *res.body_mut() = stream_body.boxed();
                 }
             } else {
                 *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
@@ -1013,6 +1168,7 @@ impl Server {
         kind: DataKind,
         head_only: bool,
         user: Option<String>,
+        access_paths: &AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
         let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
@@ -1025,12 +1181,13 @@ impl Server {
         file.take(1024).read_to_end(&mut buffer).await?;
         let editable =
             meta.len() <= EDITABLE_TEXT_MAX_SIZE && content_inspector::inspect(&buffer).is_text();
+        let readwrite = access_paths.perm().readwrite();
         let data = EditData {
             href,
             kind,
             uri_prefix: self.args.uri_prefix.clone(),
-            allow_upload: self.args.allow_upload,
-            allow_delete: self.args.allow_delete,
+            allow_upload: self.args.allow_upload && readwrite,
+            allow_delete: self.args.allow_delete && readwrite,
             auth: self.args.auth.has_users(),
             user,
             editable,
@@ -1039,11 +1196,7 @@ impl Server {
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
         let index_data = STANDARD.encode(serde_json::to_string(&data)?);
         let output = self
-            .html
-            .replace(
-                "__ASSETS_PREFIX__",
-                &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
-            )
+            .render_html(&self.html)
             .replace("__INDEX_DATA__", &index_data);
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
@@ -1067,10 +1220,9 @@ impl Server {
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
-        if head_only {
-            return Ok(());
+        if !head_only {
+            *res.body_mut() = body_full(output);
         }
-        *res.body_mut() = body_full(output);
         Ok(())
     }
 
@@ -1079,18 +1231,28 @@ impl Server {
         relative_path: &str,
         user: Option<String>,
         duration: Option<&String>,
+        head_only: bool,
         res: &mut Response,
     ) -> Result<()> {
         let duration = duration.map(|v| v.parse::<u64>()).transpose()?;
+        let user = match user {
+            Some(user) => user,
+            None => {
+                self.auth_reject(res, false)?;
+                return Ok(());
+            }
+        };
         let output = self
             .args
             .auth
-            .generate_token(relative_path, &user.unwrap_or_default(), duration)?;
+            .generate_token(relative_path, &user, duration)?;
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_PLAIN_UTF_8));
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
-        *res.body_mut() = body_full(output);
+        if !head_only {
+            *res.body_mut() = body_full(output);
+        }
         Ok(())
     }
 
@@ -1102,11 +1264,25 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         let depth: u32 = match headers.get("depth") {
+            // RFC 4918 9.1: refusing infinite depth with DAV:propfind-finite-depth
+            // lets clients fall back to walking the tree with Depth: 1.
+            Some(v) if v.as_bytes().eq_ignore_ascii_case(b"infinity") => {
+                *res.status_mut() = StatusCode::FORBIDDEN;
+                res.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("application/xml; charset=utf-8"),
+                );
+                *res.body_mut() = body_full(
+                    r#"<?xml version="1.0" encoding="utf-8" ?>
+<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>"#,
+                );
+                return Ok(());
+            }
             Some(v) => match v.to_str().ok().and_then(|v| v.parse().ok()) {
                 Some(0) => 0,
                 Some(1) => 1,
                 _ => {
-                    status_bad_request(res, "Invalid depth: only 0 and 1 are allowed.");
+                    DufsErrorCode::InvalidDepth.respond(res);
                     return Ok(());
                 }
             },
@@ -1118,12 +1294,12 @@ impl Server {
         };
         if depth == 1 {
             match self
-                .list_dir(path, &self.args.serve_path, access_paths)
+                .list_dir(path, &self.args.serve_path, &access_paths)
                 .await
             {
                 Ok(child) => paths.extend(child),
                 Err(_) => {
-                    status_forbid(res);
+                    DufsErrorCode::InternalError.respond(res);
                     return Ok(());
                 }
             }
@@ -1155,7 +1331,7 @@ impl Server {
     }
 
     async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res) {
+        let dest = match self.extract_dest(req, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1164,15 +1340,31 @@ impl Server {
 
         let meta = fs::symlink_metadata(path).await?;
         if meta.is_dir() {
-            status_forbid(res);
+            DufsErrorCode::IsADirectory.respond(res);
+            return Ok(());
+        }
+
+        if self.guard_root_contained(&dest).await {
+            DufsErrorCode::InvalidDestination.respond(res);
             return Ok(());
         }
 
         ensure_path_parent(&dest).await?;
 
-        if self.guard_root_contained(&dest).await {
-            status_bad_request(res, "Invalid Destination");
-            return Ok(());
+        let overwrite = req
+            .headers()
+            .get("overwrite")
+            .map(|v| v.as_bytes() != b"F")
+            .unwrap_or(true);
+        if fs::symlink_metadata(&dest).await.is_ok() {
+            if !overwrite {
+                DufsErrorCode::DestinationExists.respond(res);
+                return Ok(());
+            }
+            if !self.args.allow_delete {
+                DufsErrorCode::DeleteDisabled.respond(res);
+                return Ok(());
+            }
         }
 
         fs::copy(path, &dest).await?;
@@ -1182,19 +1374,19 @@ impl Server {
     }
 
     async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res) {
+        let dest = match self.extract_dest(req, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
             }
         };
 
-        ensure_path_parent(&dest).await?;
-
         if self.guard_root_contained(&dest).await {
-            status_bad_request(res, "Invalid Destination");
+            DufsErrorCode::InvalidDestination.respond(res);
             return Ok(());
         }
+
+        ensure_path_parent(&dest).await?;
 
         fs::rename(path, &dest).await?;
 
@@ -1266,7 +1458,9 @@ impl Server {
                 .map(|v| v == "desc")
                 .unwrap_or_default()
             {
-                paths.reverse()
+                paths.reverse();
+                // keep directories grouped on top, in reverse order within the group
+                paths.sort_by_key(|v| !v.path_type.is_dir());
             }
         } else {
             paths.sort_by(|v1, v2| v1.sort_by_name(v2))
@@ -1325,11 +1519,7 @@ impl Server {
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
 
             let index_data = STANDARD.encode(serde_json::to_string(&data)?);
-            self.html
-                .replace(
-                    "__ASSETS_PREFIX__",
-                    &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
-                )
+            self.render_html(&self.html)
                 .replace("__INDEX_DATA__", &index_data)
         };
         res.headers_mut()
@@ -1347,10 +1537,10 @@ impl Server {
         Ok(())
     }
 
-    fn auth_reject(&self, res: &mut Response) -> Result<()> {
+    fn auth_reject(&self, res: &mut Response, stale: bool) -> Result<()> {
         set_webdav_headers(res);
 
-        www_authenticate(res, &self.args)?;
+        www_authenticate(res, &self.args, stale)?;
         *res.status_mut() = StatusCode::UNAUTHORIZED;
         Ok(())
     }
@@ -1359,15 +1549,14 @@ impl Server {
         if self.args.allow_symlink {
             return false;
         }
-        let path = if !fs::try_exists(path).await.unwrap_or_default() {
-            match path.parent() {
-                Some(parent) => parent.to_path_buf(),
+        let mut check_path = path.to_path_buf();
+        while fs::symlink_metadata(&check_path).await.is_err() {
+            match check_path.parent() {
+                Some(parent) => check_path = parent.to_path_buf(),
                 None => return true,
             }
-        } else {
-            path.to_path_buf()
-        };
-        !self.is_root_contained(path.as_path()).await
+        }
+        !self.is_root_contained(check_path.as_path()).await
     }
 
     async fn is_root_contained(&self, path: &Path) -> bool {
@@ -1378,7 +1567,7 @@ impl Server {
             .unwrap_or_default()
     }
 
-    fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
+    async fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
         let headers = req.headers();
         let dest_path = match self
             .extract_destination_header(headers)
@@ -1386,21 +1575,31 @@ impl Server {
         {
             Some(dest) => dest,
             None => {
-                status_bad_request(res, "Invalid Destination");
+                DufsErrorCode::InvalidDestination.respond(res);
                 return None;
             }
         };
 
         let authorization = headers.get(AUTHORIZATION);
+        let request_target = req.uri().to_string();
         let guard = self
             .args
             .auth
-            .guard(&dest_path, req.method(), authorization, None, false);
+            .guard(
+                &dest_path,
+                req.method(),
+                &request_target,
+                authorization,
+                None,
+                false,
+                &self.args.serve_path,
+            )
+            .await;
 
         match guard {
-            (_, Some(_)) => {}
+            (_, Some(_), _, _) => {}
             _ => {
-                status_forbid(res);
+                DufsErrorCode::Forbidden.respond(res);
                 return None;
             }
         };
@@ -1408,7 +1607,7 @@ impl Server {
         let dest = match self.join_path(&dest_path) {
             Some(dest) => dest,
             None => {
-                *res.status_mut() = StatusCode::BAD_REQUEST;
+                DufsErrorCode::InvalidDestination.respond(res);
                 return None;
             }
         };
@@ -1445,8 +1644,11 @@ impl Server {
         if path_prefix.is_empty() {
             return Some(new_path);
         }
+        if new_path == path_prefix {
+            return Some(String::new());
+        }
         new_path
-            .strip_prefix(path_prefix.trim_start_matches('/'))
+            .strip_prefix(&format!("{path_prefix}/"))
             .map(|v| v.trim_matches('/').to_string())
     }
 
@@ -1459,37 +1661,72 @@ impl Server {
         } else {
             path.to_string()
         };
-        Some(self.args.serve_path.join(path))
+        join_within(&self.args.serve_path, &path)
+    }
+
+    /// Path components of `path` relative to the served root, used to resolve
+    /// auth rules and filesystem aliases of configured names.
+    fn relative_parts<'a>(&self, path: &'a Path) -> Vec<&'a str> {
+        path.strip_prefix(&self.args.serve_path)
+            .unwrap_or(Path::new(""))
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn set_item_access(&self, item: &mut PathItem, access: EntryAccess) {
+        let readwrite = access.perm.readwrite();
+        let restricted = item.is_dir() && access.restricted;
+        item.allow_upload = self.args.allow_upload && readwrite;
+        item.allow_delete = self.args.allow_delete && readwrite && !restricted;
+        item.readonly_descendant = restricted;
     }
 
     async fn list_dir(
         &self,
         entry_path: &Path,
         base_path: &Path,
-        access_paths: AccessPaths,
+        access_paths: &AccessPaths,
     ) -> Result<Vec<PathItem>> {
         let mut paths: Vec<PathItem> = vec![];
+        let prefix = self.relative_parts(entry_path);
         if access_paths.perm().indexonly() {
             for name in access_paths.child_names() {
                 let entry_path = entry_path.join(name);
-                self.add_pathitem(&mut paths, base_path, &entry_path).await;
+                self.add_pathitem(&mut paths, base_path, &entry_path, access_paths, &prefix)
+                    .await;
             }
         } else {
             let mut rd = fs::read_dir(entry_path).await?;
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let entry_path = entry.path();
-                self.add_pathitem(&mut paths, base_path, &entry_path).await;
+                self.add_pathitem(&mut paths, base_path, &entry_path, access_paths, &prefix)
+                    .await;
             }
         }
         Ok(paths)
     }
 
-    async fn add_pathitem(&self, paths: &mut Vec<PathItem>, base_path: &Path, entry_path: &Path) {
+    async fn add_pathitem(
+        &self,
+        paths: &mut Vec<PathItem>,
+        base_path: &Path,
+        entry_path: &Path,
+        access_paths: &AccessPaths,
+        prefix: &[&str],
+    ) {
         let base_name = get_file_name(entry_path);
-        if let Ok(Some(item)) = self.to_pathitem(entry_path, base_path).await {
+        if let Ok(Some(mut item)) = self.to_pathitem(entry_path, base_path).await {
             if is_hidden(&self.args.hidden, base_name, item.is_dir()) {
                 return;
             }
+            let access = access_paths
+                .entry_access(base_name, prefix, Some(&self.args.serve_path))
+                .await;
+            self.set_item_access(&mut item, access);
             paths.push(item);
         }
     }
@@ -1544,6 +1781,9 @@ impl Server {
             name,
             mtime,
             size,
+            allow_upload: false,
+            allow_delete: false,
+            readonly_descendant: false,
         }))
     }
 }
@@ -1576,6 +1816,9 @@ pub struct PathItem {
     pub name: String,
     pub mtime: u64,
     pub size: u64,
+    pub allow_upload: bool,
+    pub allow_delete: bool,
+    pub readonly_descendant: bool,
 }
 
 impl PathItem {
@@ -1588,7 +1831,7 @@ impl PathItem {
             LocalResult::Single(v) => format!("{}", v.format("%a, %d %b %Y %H:%M:%S GMT")),
             _ => String::new(),
         };
-        let mut href = encode_uri(&format!("{}{}", prefix, &self.name));
+        let mut href = encode_uri(&format!("{}{}", prefix, self.name));
         if self.is_dir() && !href.ends_with('/') {
             href.push('/');
         }
@@ -1736,7 +1979,7 @@ fn add_cors(res: &mut Response) {
     );
     res.headers_mut().insert(
         "Access-Control-Expose-Headers",
-        HeaderValue::from_static("Authorization,*"),
+        HeaderValue::from_static("Authorization,X-Dufs-Error-Code,*"),
     );
 }
 
@@ -1759,12 +2002,11 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     dir: &Path,
     access_paths: AccessPaths,
     hidden: &[String],
-    compression: Compression,
+    compression: CompressionLevel,
     follow_symlinks: bool,
     serve_path: PathBuf,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut writer = ZipFileWriter::with_tokio(writer);
     let hidden = Arc::new(hidden.to_vec());
     let zip_paths = tokio::task::spawn(collect_dir_entries(
         access_paths,
@@ -1773,9 +2015,18 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         hidden,
         follow_symlinks,
         serve_path,
-        move |x| x.path().symlink_metadata().is_ok() && x.file_type().is_file(),
+        move |x| {
+            // Include both files and directories. Symbolic links are already
+            // resolved by `follow_links`, so `file_type` reports the target's
+            // type.
+            x.path().symlink_metadata().is_ok() && {
+                let file_type = x.file_type();
+                file_type.is_file() || file_type.is_dir()
+            }
+        },
     ))
     .await?;
+    let mut zip = ZipWriter::new(&mut *writer).with_compression_level(compression);
     for zip_path in zip_paths.into_iter() {
         let filename = match zip_path
             .strip_prefix(dir)
@@ -1786,16 +2037,20 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
             Some(v) => v,
             None => continue,
         };
-        let (datetime, mode) = get_file_mtime_and_mode(&zip_path).await?;
-        let builder = ZipEntryBuilder::new(filename.into(), compression)
-            .unix_permissions(mode)
-            .last_modification_date(ZipDateTime::from_chrono(&datetime));
-        let mut file = File::open(&zip_path).await?;
-        let mut file_writer = writer.write_entry_stream(builder).await?.compat_write();
-        io::copy(&mut file, &mut file_writer).await?;
-        file_writer.into_inner().close().await?;
+        // Follow symlinks so that a symlinked entry records the permissions
+        // and modification time of its target.
+        let meta = match tokio::fs::metadata(&zip_path).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            let options = EntryOptions::from_path_following(&zip_path).await?;
+            zip.add_directory(&filename, &options).await?;
+        } else {
+            zip.add_file(&filename, &zip_path).await?;
+        }
     }
-    writer.close().await?;
+    zip.finish().await?;
     Ok(())
 }
 
@@ -1808,11 +2063,6 @@ fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
     Some((etag, last_modified))
 }
 
-fn status_forbid(res: &mut Response) {
-    *res.status_mut() = StatusCode::FORBIDDEN;
-    *res.body_mut() = body_full("Forbidden");
-}
-
 fn status_not_found(res: &mut Response) {
     *res.status_mut() = StatusCode::NOT_FOUND;
     *res.body_mut() = body_full("Not Found");
@@ -1820,13 +2070,6 @@ fn status_not_found(res: &mut Response) {
 
 fn status_no_content(res: &mut Response) {
     *res.status_mut() = StatusCode::NO_CONTENT;
-}
-
-fn status_bad_request(res: &mut Response, body: &str) {
-    *res.status_mut() = StatusCode::BAD_REQUEST;
-    if !body.is_empty() {
-        *res.body_mut() = body_full(body.to_string());
-    }
 }
 
 fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {

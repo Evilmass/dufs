@@ -52,6 +52,23 @@ fn propfind_dir_depth2(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn propfind_dir_depth_infinity(server: TestServer) -> Result<(), Error> {
+    let resp = fetch!(b"PROPFIND", format!("{}dir1", server.url()))
+        .header("depth", "infinity")
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/xml; charset=utf-8")
+    );
+    let body = resp.text()?;
+    assert!(body.contains("<D:propfind-finite-depth/>"));
+    Ok(())
+}
+
+#[rstest]
 fn propfind_404(server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"PROPFIND", format!("{}404", server.url())).send()?;
     assert_eq!(resp.status(), 404);
@@ -137,6 +154,35 @@ fn copy_not_allow_upload(server: TestServer) -> Result<(), Error> {
         .header("Destination", &new_url)
         .send()?;
     assert_eq!(resp.status(), 403);
+    Ok(())
+}
+
+#[rstest]
+fn copy_no_overwrite_without_delete(
+    #[with(&["--allow-upload"])] server: TestServer,
+) -> Result<(), Error> {
+    let dest_url = format!("{}test.html", server.url());
+    let resp = fetch!(b"COPY", format!("{}test.txt", server.url()))
+        .header("Destination", &dest_url)
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    let resp = reqwest::blocking::get(dest_url)?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is test.html");
+    Ok(())
+}
+
+#[rstest]
+fn copy_overwrite_false(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let dest_url = format!("{}test.html", server.url());
+    let resp = fetch!(b"COPY", format!("{}test.txt", server.url()))
+        .header("Destination", &dest_url)
+        .header("Overwrite", "F")
+        .send()?;
+    assert_eq!(resp.status(), 412);
+    let resp = reqwest::blocking::get(dest_url)?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is test.html");
     Ok(())
 }
 
